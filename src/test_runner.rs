@@ -305,41 +305,53 @@ impl Default for TestRunner {
 
 
 
-
-
+use std::marker::PhantomData;
 
 /// TODO
-pub trait FunctionUnderTest<V> {
+pub trait Testable<V> {
     /// TODO
-    fn test(&self, &V) -> TestCaseResult;
+    fn test(&mut self, &V) -> TestCaseResult;
+}
+
+impl<'a, V, F: Testable<V>> Testable<V> for &'a mut F {
+    fn test(&mut self, case: &V) -> TestCaseResult {
+        use std::ops::DerefMut;
+        self.deref_mut().test(case)
+    }
+}
+
+/// TODO
+pub struct ShouldPanic<F> {
+    inner: F,
+}
+
+/// TODO
+pub fn should_panic<V, F: Fn(&V) -> TestCaseResult>(inner: F) -> ShouldPanic<F> {
+    ShouldPanic { inner }
+}
+
+impl<V, F: Fn(&V) -> TestCaseResult> Testable<V> for ShouldPanic<F> {
+    fn test(&mut self, case: &V) -> TestCaseResult {
+        match panic::catch_unwind(AssertUnwindSafe(|| (self.inner)(&case))) {
+            Ok(_) => Err(fail_case("ShouldPanic test failed to panic.")),
+            Err(_) => Ok(()),
+        }
+    }
 }
 
 /// TODO
 pub struct PanicGuard<F> {
-    inner: F
+    inner: F,
 }
 
 /// TODO
-pub fn panic_guard<F>(inner: F) -> PanicGuard<F> {
+pub fn panic_guard<V, F: Fn(&V) -> TestCaseResult>(inner: F) -> PanicGuard<F> {
     PanicGuard { inner }
 }
 
-impl<V, R, F> FunctionUnderTest<V> for F
-where
-    R: Into<TestCaseResult>,
-    F: Fn(&V) -> R
-{
-    fn test(&self, case: &V) -> TestCaseResult {
-        (self)(case).into()
-    }
-}
-
-impl<V, F> FunctionUnderTest<V> for PanicGuard<F>
-where
-    F: FunctionUnderTest<V>
-{
-    fn test(&self, case: &V) -> TestCaseResult {
-        match panic::catch_unwind(AssertUnwindSafe(|| self.inner.test(&case))) {
+impl<V, F: Fn(&V) -> TestCaseResult> Testable<V> for PanicGuard<F> {
+    fn test(&mut self, case: &V) -> TestCaseResult {
+        match panic::catch_unwind(AssertUnwindSafe(|| (self.inner)(&case))) {
             Ok(r) => r,
             Err(what) => {
                 let msg = what.downcast::<&'static str>()
@@ -355,10 +367,45 @@ where
     }
 }
 
+/*
+/// TODO
+pub struct TestFn<V, F> {
+    inner: F
+}
 
+/// TODO
+pub fn test_fn<V, F>(inner: F) -> TestFn<F>
+where
+    F: Fn(&V) -> TestCaseResult
+{
+    TestFn { inner }
+}
 
+impl<V, F> Testable<V> for TestFn<F>
+where
+    F: Fn(&V) -> TestCaseResult
+{
+    fn test(&self, case: &V) -> TestCaseResult {
+        (self.inner)(case).into()
+    }
+}
+*/
 
-
+/*
+impl<V, F> FunctionUnderTest<V> for F
+where
+    F: Fn(&V) -> TestCaseResult
+{
+    default fn test(&self, case: &V) -> TestCaseResult {
+        (self)(case).into()
+    }
+}
+impl<V> FunctionUnderTest<V> for (for<'r> fn(&'r V) -> TestCaseResult) {
+    fn test(&self, case: &V) -> TestCaseResult {
+        (self)(case).into()
+    }
+}
+*/
 
 impl TestRunner {
     /// Create a fresh `TestRunner` with the given configuration.
@@ -408,8 +455,8 @@ impl TestRunner {
     ///
     /// Returns success or failure indicating why the test as a whole failed.
     pub fn run<S : Strategy,
-               F : Fn (&ValueFor<S>) -> TestCaseResult>
-        (&mut self, strategy: &S, f: F)
+               F : Testable<ValueFor<S>>> //Fn (&ValueFor<S>) -> TestCaseResult>
+        (&mut self, strategy: &S, mut test: F)
          -> Result<(), TestError<ValueFor<S>>>
     {
         while self.successes < self.config.cases {
@@ -417,7 +464,7 @@ impl TestRunner {
                 Ok(v) => v,
                 Err(msg) => return Err(TestError::Abort(msg)),
             };
-            if self.run_one(case, &f)? {
+            if self.run_one(case, &mut test)? {
                 self.successes += 1;
             }
         }
@@ -430,19 +477,19 @@ impl TestRunner {
     /// If the test fails, finds the minimal failing test case. If the test
     /// does not fail, returns whether it succeeded or was filtered out.
     pub fn run_one<V : ValueTree,
-                   F : FunctionUnderTest<V::Value>>
-        (&mut self, mut case: V, f: F) -> Result<bool, TestError<V::Value>>
+                   F : Testable<V::Value>>// Fn(&V::Value) -> TestCaseResult>
+        (&mut self, mut case: V, mut test: F) -> Result<bool, TestError<V::Value>>
     {
-        let pg = panic_guard(f);
+        //let pg = panic_guard(f);
         let curr = case.current();
-        match pg.test(&curr) {
+        match test.test(&curr) {
             Ok(_) => Ok(true),
             Err(TestCaseError::Fail(why)) => {
                 let mut last_failure = (why, curr);
                 if case.simplify() {
                     loop {
                         let curr = case.current();
-                        let passed = match pg.test(&curr) {
+                        let passed = match test.test(&curr) {
                             // Rejections are effectively a pass here,
                             // since they indicate that any behaviour of
                             // the function under test is acceptable.
