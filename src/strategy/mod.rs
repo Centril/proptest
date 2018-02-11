@@ -25,7 +25,7 @@ pub use self::map::*;
 pub use self::filter::*;
 pub use self::flatten::*;
 pub use self::unions::*;
-pub use self::recursive::*;
+pub use self::recursive::{Recursive, RecArg};
 pub use self::shuffle::*;
 pub use self::fuse::*;
 

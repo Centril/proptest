@@ -11,21 +11,156 @@ use std::fmt;
 use std::sync::Arc;
 
 use strategy::traits::*;
+use strategy::IndFlatten;
+use strategy::statics::{Map, MapFn};
 use test_runner::*;
+
+/// A branching `MapFn` that picks `yes` (true) or
+/// `no` (false) and clones the `Arc`.
+struct BranchFn<T> {
+    /// Result on true.
+    yes: Arc<T>,
+    /// Result on false.
+    no: Arc<T>,
+}
+
+impl<T> Clone for BranchFn<T> {
+    fn clone(&self) -> Self {
+        Self { yes: Arc::clone(&self.yes), no: Arc::clone(&self.no) }
+    }
+}
+
+impl<T: fmt::Debug> MapFn<bool> for BranchFn<T> {
+    type Output = Arc<T>;
+    fn apply(&self, branch: bool) -> Self::Output {
+        Arc::clone(if branch { &self.yes } else { &self.no })
+    }
+}
+
+/// The branching strategy between recuring or not.
+type Branch<S> = IndFlatten<Map<::bool::Weighted, BranchFn<S>>>;
+
+/// The `ValueTree` of `RegArgInner`.
+
+enum RecVT<L: Strategy, R: Strategy>
+where R::Value: ValueTree<Value = ValueFor<L>> {
+    /// See RecArgInner::Leaf.
+    Leaf(L::Value),
+    /// See RecArgInner::Recur.
+    Recur(R::Value),
+    /// See RecArgInner::Branch.
+    Branch(Box<<Branch<RecArg<L, R>> as Strategy>::Value>),
+}
+
+/// The real implementation of `RecArg<L, R>`.
+#[derive(Debug)]
+enum RecArgInner<L: Strategy, R: Strategy>
+where R::Value: ValueTree<Value = ValueFor<L>> {
+    /// Leaf strategy in `leaf.prop_recursive(..)`.
+    Leaf(L),
+    /// Recursive strategy returned in
+    /// `leaf.prop_recursive(.., |arg| <return>)`.
+    Recur(R),
+    /// For `IndFlatten`.
+    Branch(Branch<RecArg<L, R>>),
+}
+
+impl<L: Strategy, R: Strategy> ValueTree for RecVT<L, R>
+where R::Value: ValueTree<Value = ValueFor<L>> {
+    type Value = ValueFor<L>;
+
+    fn current(&self) -> Self::Value {
+        match *self {
+            RecVT::Leaf(ref vt) => vt.current(),
+            RecVT::Recur(ref vt) => vt.current(),
+            RecVT::Branch(ref vt) => vt.current(),
+        }
+    }
+
+    fn simplify(&mut self) -> bool {
+        match *self {
+            RecVT::Leaf(ref mut vt) => vt.simplify(),
+            RecVT::Recur(ref mut vt) => vt.simplify(),
+            RecVT::Branch(ref mut vt) => vt.simplify(),
+        }
+    }
+
+    fn complicate(&mut self) -> bool {
+        match *self {
+            RecVT::Leaf(ref mut vt) => vt.complicate(),
+            RecVT::Recur(ref mut vt) => vt.complicate(),
+            RecVT::Branch(ref mut vt) => vt.complicate(),
+        }
+    }
+}
+
+impl<L: Strategy, R: Strategy> Strategy for RecArgInner<L, R>
+where R::Value: ValueTree<Value = ValueFor<L>> {
+    type Value = RecVT<L, R>;
+
+    fn new_value(&self, runner: &mut TestRunner) -> NewTree<Self> {
+        match *self {
+            RecArgInner::Leaf(ref s)
+                => s.new_value(runner).map(RecVT::Leaf),
+            RecArgInner::Recur(ref s)
+                => s.new_value(runner).map(RecVT::Recur),
+            RecArgInner::Branch(ref s)
+                => s.new_value(runner).map(|vt| RecVT::Branch(Box::new(vt))),
+        }
+    }
+}
+
+opaque_strategy_wrapper! {
+    /// Argument type of the `<closure>` you pass to
+    /// `leaf.prop_recursive(_, _, _, <closure>)`.
+    #[derive(Debug)]
+    pub struct RecArg
+        [<Leaf, Recur>]
+        [where Leaf: Strategy, Recur: Strategy,
+               Recur::Value: ValueTree<Value = ValueFor<Leaf>>]
+        (RecArgInner<Leaf, Recur>) -> RecArgValueTree<Leaf, Recur>;
+
+    /// `ValueTree` corresponding to `RecArg`.
+    pub struct RecArgValueTree
+        [<Leaf, Recur>]
+        [where Leaf: Strategy, Recur: Strategy,
+               Recur::Value: ValueTree<Value = ValueFor<Leaf>>]
+        (RecVT<Leaf, Recur>) -> ValueFor<Leaf>;
+}
 
 /// Return type from `Strategy::prop_recursive()`.
 pub struct Recursive<B, F> {
-    pub(super) base: Arc<B>,
+    pub(super) leaf: Arc<B>,
     pub(super) recurse: Arc<F>,
     pub(super) depth: u32,
     pub(super) desired_size: u32,
     pub(super) expected_branch_size: u32,
 }
 
-impl<B : fmt::Debug, F> fmt::Debug for Recursive<B, F> {
+impl<Leaf, Recur, F> Recursive<RecArg<Leaf, Recur>, F>
+where
+    F: Fn(Arc<RecArg<Leaf, Recur>>) -> Recur,
+    Leaf: Strategy,
+    Recur: Strategy,
+    Recur::Value: ValueTree<Value = ValueFor<Leaf>>,
+{
+    pub(super) fn new
+        (leaf: Leaf, depth: u32, desired_size: u32, expected_branch_size: u32,
+         recurse: F)
+        -> Self
+    {
+        Recursive {
+            leaf: Arc::new(RecArg(RecArgInner::Leaf(leaf))),
+            recurse: Arc::new(recurse),
+            depth, desired_size, expected_branch_size,
+        }
+    }
+}
+
+impl<B: fmt::Debug, F> fmt::Debug for Recursive<B, F> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Recursive")
-            .field("base", &self.base)
+            .field("leaf", &self.leaf)
             .field("recurse", &"<function>")
             .field("depth", &self.depth)
             .field("desired_size", &self.desired_size)
@@ -37,7 +172,7 @@ impl<B : fmt::Debug, F> fmt::Debug for Recursive<B, F> {
 impl<B, F> Clone for Recursive<B, F> {
     fn clone(&self) -> Self {
         Recursive {
-            base: Arc::clone(&self.base),
+            leaf: Arc::clone(&self.leaf),
             recurse: Arc::clone(&self.recurse),
             depth: self.depth,
             desired_size: self.desired_size,
@@ -46,10 +181,14 @@ impl<B, F> Clone for Recursive<B, F> {
     }
 }
 
-impl<T : fmt::Debug + 'static,
-     F : Fn (Arc<BoxedStrategy<T>>) -> BoxedStrategy<T>>
-Strategy for Recursive<BoxedStrategy<T>, F> {
-    type Value = Box<ValueTree<Value = T>>;
+impl<Leaf, Recur, F> Strategy for Recursive<RecArg<Leaf, Recur>, F>
+where
+    F: Fn(Arc<RecArg<Leaf, Recur>>) -> Recur,
+    Leaf: Strategy,
+    Recur: Strategy,
+    Recur::Value: ValueTree<Value = ValueFor<Leaf>>,
+{
+    type Value = <RecArg<Leaf, Recur> as Strategy>::Value;
 
     fn new_value(&self, runner: &mut TestRunner) -> NewTree<Self> {
         // Since the generator is stateless, we can't implement any "absolutely
@@ -88,17 +227,22 @@ Strategy for Recursive<BoxedStrategy<T>, F> {
             k2 = k2.saturating_mul(u64::from(self.expected_branch_size) * 2);
         }
 
-        let mut strat = Arc::clone(&self.base);
+        let mut strat = Arc::clone(&self.leaf);
+
         while let Some(branch_probability) = branch_probabilities.pop() {
-            let recursive_choice = Arc::new((self.recurse)(Arc::clone(&strat)));
+            let recursed = (self.recurse)(Arc::clone(&strat));
+            let recursive_choice = Arc::new(RecArg(RecArgInner::Recur(recursed)));
+
             let non_recursive_choice = strat;
-            strat = Arc::new(
-                ::bool::weighted(branch_probability.min(0.9))
-                    .prop_ind_flat_map(move |branch| if branch {
-                        Arc::clone(&recursive_choice)
-                    } else {
-                        Arc::clone(&non_recursive_choice)
-                    }).boxed());
+
+            let branch_strat = ::bool::weighted(branch_probability.min(0.9));
+
+            let branched_strat = IndFlatten(Map::new(branch_strat, BranchFn {
+                yes: recursive_choice,
+                no: non_recursive_choice
+            }));
+
+            strat = Arc::new(RecArg(RecArgInner::Branch(branched_strat)));
         }
 
         strat.new_value(runner)
@@ -142,11 +286,10 @@ mod test {
         let mut max_depth = 0;
         let mut max_count = 0;
 
-        let strat = Just(Tree::Leaf).prop_recursive(
-            4, 64, 16,
-            |element| ::collection::vec(element, 8..16)
-                .prop_map(Tree::Branch).boxed());
-
+        let strat = Just(Tree::Leaf).prop_recursive(4, 64, 16,
+            |element| {
+                ::collection::vec(element, 8..16).prop_map(Tree::Branch).boxed()
+            });
 
         let mut runner = TestRunner::default();
         for _ in 0..65536 {
