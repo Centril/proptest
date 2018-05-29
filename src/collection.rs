@@ -9,11 +9,10 @@
 
 //! Strategies for generating `std::collections` of values.
 
-#![cfg_attr(feature="cargo-clippy", allow(type_complexity))]
-
+use core::marker::PhantomData;
 use core::cmp::Ord;
 use core::fmt;
-use core::hash::Hash;
+use core::hash::{Hash, BuildHasher};
 use core::ops::{Add, Range, RangeTo};
 
 #[cfg(all(feature = "alloc", not(feature="std")))]
@@ -32,9 +31,9 @@ use alloc::{BinaryHeap, BTreeMap, BTreeSet, LinkedList};
 use std::collections::{BinaryHeap, BTreeMap, BTreeSet, LinkedList};
 
 #[cfg(all(feature = "alloc", not(feature="std")))]
-use hashmap_core::{HashMap, HashSet};
+use hashmap_core::map::{HashMap, HashSet, RandomState};
 #[cfg(feature = "std")]
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::RandomState};
 
 use bit_set::BitSet;
 use rand;
@@ -247,9 +246,20 @@ where ValueFor<T> : Ord {
     BinaryHeapStrategy(statics::Map::new(vec(element, size), VecToBinHeap))
 }
 
-mapfn! {
-    [] fn VecToHashSet[<T : fmt::Debug + Hash + Eq>](vec: Vec<T>)
-                                                     -> HashSet<T> {
+#[derive(Debug, Copy)]
+struct VecToHashSet<R>(PhantomData<R>);
+
+impl<R> Clone for VecToHashSet<R> {
+    fn clone(&self) -> Self { Self { 0: PhantomData } }
+}
+
+impl<T, R> ::strategy::statics::MapFn<Vec<T>> for VecToHashSet<R>
+where
+    T: fmt::Debug + Hash + Eq,
+    R: BuildHasher + Default,
+{
+    type Output = HashSet<T, R>;
+    fn apply(&self, vec: Vec<T>) -> Self::Output {
         vec.into_iter().collect()
     }
 }
@@ -257,25 +267,51 @@ mapfn! {
 #[derive(Debug, Clone, Copy)]
 struct MinSize(usize);
 
-impl<T : Eq + Hash> statics::FilterFn<HashSet<T>> for MinSize {
-    fn apply(&self, set: &HashSet<T>) -> bool {
+impl<T, R> statics::FilterFn<HashSet<T, R>> for MinSize
+where
+    T: Eq + Hash,
+    R: BuildHasher,
+{
+    fn apply(&self, set: &HashSet<T, R>) -> bool {
         set.len() >= self.0
     }
 }
 
-opaque_strategy_wrapper! {
-    /// Strategy to create `HashSet`s with a length in a certain range.
-    ///
-    /// Created by the `hash_set()` function in the same module.
-    #[derive(Clone, Debug)]
-    pub struct HashSetStrategy[<T>][where T : Strategy, ValueFor<T> : Hash + Eq](
-        statics::Filter<statics::Map<VecStrategy<T>, VecToHashSet>, MinSize>)
-        -> HashSetValueTree<T::Value>;
-    /// `ValueTree` corresponding to `HashSetStrategy`.
-    #[derive(Clone, Debug)]
-    pub struct HashSetValueTree[<T>][where T : ValueTree, T::Value : Hash + Eq](
-        statics::Filter<statics::Map<VecValueTree<T>, VecToHashSet>, MinSize>)
-        -> HashSet<T::Value>;
+/// Strategy to create `HashSet`s with a length in a certain range.
+///
+/// Created by the `hash_set()` function in the same module.
+#[derive(Clone, Debug)]
+pub struct HashSetStrategy<T: Strategy, R = RandomState>(
+    statics::Filter<statics::Map<VecStrategy<T>, VecToHashSet<R>>, MinSize>
+);
+
+/// `ValueTree` corresponding to `HashSetStrategy`.
+#[derive(Clone, Debug)]
+pub struct HashSetValueTree<T: ValueTree, R = RandomState>(
+    statics::Filter<statics::Map<VecValueTree<T>, VecToHashSet<R>>, MinSize>
+);
+
+impl<T, R> Strategy for HashSetStrategy<T, R>
+where
+    T: Strategy,
+    ValueFor<T>: Hash + Eq,
+    R: BuildHasher + Default + fmt::Debug
+{
+    type Value = HashSetValueTree<T::Value, R>;
+    fn new_value(&self, runner: &mut TestRunner) -> NewTree<Self> {
+        self.0.new_value(runner).map(HashSetValueTree)
+    }
+}
+
+impl<T, R> ValueTree for HashSetValueTree<T, R>
+where
+    T: ValueTree,
+    T::Value: Hash + Eq,
+    R: BuildHasher + Default
+{
+    type Value = HashSet<T::Value, R>;
+
+    delegate_vt_0!();
 }
 
 /// Create a strategy to generate `HashSet`s containing elements drawn from
@@ -284,16 +320,17 @@ opaque_strategy_wrapper! {
 /// This strategy will implicitly do local rejects to ensure that the `HashSet`
 /// has at least the minimum number of elements, in case `element` should
 /// produce duplicate values.
-pub fn hash_set<T, S>(element: T, size: S) -> HashSetStrategy<T>
+pub fn hash_set<T, S, R>(element: T, size: S) -> HashSetStrategy<T, R>
 where
     T: Strategy,
     ValueFor<T>: Hash + Eq,
     S: Into<SizeRange>,
+    R: BuildHasher + Default + fmt::Debug,
 {
     let size = size.into().0;
     let min_size = size.start;
     HashSetStrategy(statics::Filter::new(
-        statics::Map::new(vec(element, size), VecToHashSet),
+        statics::Map::new(vec(element, size), VecToHashSet(PhantomData)),
         "HashSet minimum size".into(),
         MinSize(min_size)))
 }
@@ -347,16 +384,31 @@ where
         MinSize(min_size)))
 }
 
-mapfn! {
-    [] fn VecToHashMap[<K : fmt::Debug + Hash + Eq, V : fmt::Debug>]
-        (vec: Vec<(K, V)>) -> HashMap<K, V>
-    {
+#[derive(Copy, Debug)]
+struct VecToHashMap<R>(PhantomData<R>);
+
+impl<R> Clone for VecToHashMap<R> {
+    fn clone(&self) -> Self { Self { 0: PhantomData } }
+}
+
+impl<K, V, R> ::strategy::statics::MapFn<Vec<(K, V)>> for VecToHashMap<R>
+where
+    K: fmt::Debug + Hash + Eq,
+    V: fmt::Debug,
+    R: BuildHasher + Default,
+{
+    type Output = HashMap<K, V, R>;
+    fn apply(&self, vec: Vec<(K, V)>) -> Self::Output {
         vec.into_iter().collect()
     }
 }
 
-impl<K : Hash + Eq, V> statics::FilterFn<HashMap<K, V>> for MinSize {
-    fn apply(&self, map: &HashMap<K, V>) -> bool {
+impl<K, V, R> statics::FilterFn<HashMap<K, V, R>> for MinSize
+where
+    K: Hash + Eq,
+    R: BuildHasher,
+{
+    fn apply(&self, map: &HashMap<K, V, R>) -> bool {
         map.len() >= self.0
     }
 }
@@ -366,18 +418,20 @@ opaque_strategy_wrapper! {
     ///
     /// Created by the `hash_map()` function in the same module.
     #[derive(Clone, Debug)]
-    pub struct HashMapStrategy[<K, V>]
-        [where K : Strategy, V : Strategy, ValueFor<K> : Hash + Eq](
+    pub struct HashMapStrategy[<K, V, R>]
+        [where K: Strategy, V: Strategy, ValueFor<K>: Hash + Eq,
+               R: BuildHasher + Default + fmt::Debug](
             statics::Filter<statics::Map<VecStrategy<(K,V)>,
-            VecToHashMap>, MinSize>)
-        -> HashMapValueTree<K::Value, V::Value>;
+            VecToHashMap<R>>, MinSize>)
+        -> HashMapValueTree<K::Value, V::Value, R>;
     /// `ValueTree` corresponding to `HashMapStrategy`.
     #[derive(Clone, Debug)]
-    pub struct HashMapValueTree[<K, V>]
-        [where K : ValueTree, V : ValueTree, K::Value : Hash + Eq](
+    pub struct HashMapValueTree[<K, V, R>]
+        [where K: ValueTree, V: ValueTree, K::Value: Hash + Eq,
+               R: BuildHasher + Default](
             statics::Filter<statics::Map<VecValueTree<TupleValueTree<(K, V)>>,
-            VecToHashMap>, MinSize>)
-        -> HashMap<K::Value, V::Value>;
+            VecToHashMap<R>>, MinSize>)
+        -> HashMap<K::Value, V::Value, R>;
 }
 
 /// Create a strategy to generate `HashMap`s containing keys and values drawn
@@ -387,17 +441,18 @@ opaque_strategy_wrapper! {
 /// This strategy will implicitly do local rejects to ensure that the `HashMap`
 /// has at least the minimum number of elements, in case `key` should produce
 /// duplicate values.
-pub fn hash_map<K, V, S>(key: K, value: V, size: S) -> HashMapStrategy<K, V>
+pub fn hash_map<K, V, S, R>(key: K, value: V, size: S) -> HashMapStrategy<K, V, R>
 where
     K: Strategy,
     V: Strategy,
     ValueFor<K>: Hash + Eq,
     S: Into<SizeRange>,
+    R: BuildHasher + Default + fmt::Debug,
 {
     let size = size.into().0;
     let min_size = size.start;
     HashMapStrategy(statics::Filter::new(
-        statics::Map::new(vec((key, value), size), VecToHashMap),
+        statics::Map::new(vec((key, value), size), VecToHashMap(PhantomData)),
         "HashMap minimum size".into(),
         MinSize(min_size)))
 }

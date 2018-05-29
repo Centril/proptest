@@ -16,31 +16,23 @@
 //==============================================================================
 
 use std::fmt;
-use std::hash::Hash;
+use std::hash::{Hash, BuildHasher};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::ops::Range;
 use std::collections::*;
 
 #[cfg(all(feature = "alloc", not(feature="std")))]
-use alloc::{vec_deque, linked_list, btree_set, binary_heap};
+use alloc::{
+    vec, vec::Vec, boxed::Box,
+    vec_deque, linked_list, btree_set, binary_heap
+};
 #[cfg(feature = "std")]
-use std::collections::{vec_deque, linked_list, btree_set, binary_heap};
-
-#[cfg(all(feature = "alloc", not(feature="std")))]
-use alloc::vec;
-#[cfg(feature = "std")]
-use std::vec;
-
-#[cfg(all(feature = "alloc", not(feature="std")))]
-use alloc::vec::Vec;
-#[cfg(feature = "std")]
-use std::vec::Vec;
-
-#[cfg(all(feature = "alloc", not(feature="std")))]
-use alloc::boxed::Box;
-#[cfg(feature = "std")]
-use std::boxed::Box;
+use std::{
+    vec, vec::Vec, boxed::Box,
+    collections::{vec_deque, linked_list, btree_set, binary_heap},
+    collections::hash_map::RandomState,
+};
 
 use strategy::*;
 use strategy::statics::static_map;
@@ -95,7 +87,17 @@ impl_1!(VecDeque, VecDequeStrategy, => vec_deque);
 impl_1!(LinkedList, LinkedListStrategy, => linked_list);
 impl_1!(BTreeSet, BTreeSetStrategy, Ord => btree_set);
 impl_1!(BinaryHeap, BinaryHeapStrategy, Ord => binary_heap);
-impl_1!(HashSet, HashSetStrategy, Hash, Eq => hash_set);
+
+arbitrary!([A: Arbitrary + Eq + Hash, R: BuildHasher + Default + fmt::Debug]
+    HashSet<A, R>,
+    HashSetStrategy<A::Strategy, R>, RangedParams1<A::Parameters>;
+    args => {
+        let product_unpack![range, a] = args;
+        hash_set(any_with::<A>(a), range)
+    });
+
+lift1!([Arbitrary + Eq + Hash] HashSet<A>, SizeRange;
+    base, args => hash_set(base, args));
 
 //==============================================================================
 // IntoIterator:
@@ -120,14 +122,25 @@ into_iter_1!(vec_deque, VecDeque);
 into_iter_1!(linked_list, LinkedList);
 into_iter_1!(btree_set, BTreeSet, Ord);
 into_iter_1!(binary_heap, BinaryHeap, Ord);
-into_iter_1!(hash_set, HashSet, Hash, Eq);
+
+arbitrary!([A: Arbitrary + Hash + Eq]
+    hash_set::IntoIter<A>,
+    SMapped<HashSet<A>, Self>,
+    <HashSet<A> as Arbitrary>::Parameters;
+    args => static_map(any_with::<HashSet<A>>(args), HashSet::into_iter));
+
+lift1!(['static + Hash + Eq] hash_set::IntoIter<A>, SizeRange;
+    base, args => hash_set::<_, _, RandomState>(base, args)
+        .prop_map(HashSet::into_iter));
 
 //==============================================================================
 // HashMap:
 //==============================================================================
 
-arbitrary!([A: Arbitrary + Hash + Eq, B: Arbitrary] HashMap<A, B>,
-    HashMapStrategy<A::Strategy, B::Strategy>,
+arbitrary!(
+    [A: Arbitrary + Hash + Eq, B: Arbitrary, S: BuildHasher + Default + fmt::Debug]
+    HashMap<A, B, S>,
+    HashMapStrategy<A::Strategy, B::Strategy, S>,
     RangedParams2<A::Parameters, B::Parameters>;
     args => {
         let product_unpack![range, a, b] = args;
@@ -139,7 +152,10 @@ arbitrary!([A: Arbitrary + Hash + Eq, B: Arbitrary] hash_map::IntoIter<A, B>,
     <HashMap<A, B> as Arbitrary>::Parameters;
     args => static_map(any_with::<HashMap<A, B>>(args), HashMap::into_iter));
 
-lift1!([, K: Hash + Eq + Arbitrary + 'static] HashMap<K, A>,
+lift1!(
+    [, K: Hash + Eq + Arbitrary + 'static,
+       R: BuildHasher + Default + fmt::Debug + 'static]
+    HashMap<K, A, R>,
     RangedParams1<K::Parameters>;
     base, args => {
         let product_unpack![range, k] = args;
@@ -151,12 +167,18 @@ lift1!(['static, K: Hash + Eq + Arbitrary + 'static] hash_map::IntoIter<K, A>,
     RangedParams1<K::Parameters>;
     base, args => {
         let product_unpack![range, k] = args;
-        static_map(hash_map(any_with::<K>(k), base, range), HashMap::into_iter)
+        static_map(
+            hash_map::<_, _, _, RandomState>(any_with::<K>(k), base, range),
+            HashMap::into_iter)
     }
 );
 
-impl<A: fmt::Debug + Eq + Hash, B: fmt::Debug> functor::ArbitraryF2<A, B>
-for HashMap<A, B> {
+impl<A, B, R> functor::ArbitraryF2<A, B> for HashMap<A, B, R>
+where
+    A: fmt::Debug + Eq + Hash,
+    B: fmt::Debug,
+    R: BuildHasher + Default + fmt::Debug + 'static,
+{
     type Parameters = SizeRange;
 
     fn lift2_with<AS, BS>(fst: AS, snd: BS, args: Self::Parameters)
@@ -184,7 +206,9 @@ for hash_map::IntoIter<A, B> {
         BS: Strategy + 'static,
         BS::Value: ValueTree<Value = B>
     {
-        static_map(hash_map(fst, snd, args), HashMap::into_iter).boxed()
+        static_map(
+            hash_map::<_, _, _, RandomState>(fst, snd, args),
+            HashMap::into_iter).boxed()
     }
 }
 
